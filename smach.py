@@ -59,14 +59,14 @@ def scan_callback(msg, userdata):
 
 
 #definition of the states
-class move_straight(smach.State):
+class MoveStraight(smach.State):
 
     def __init__(self):
         ### initializing the state, pay attention to the outcomes and input keys,
         #input keys are to declare which information of the blackboard is going to be used
         #outcomes are the possible outcomes of the state... (I don's use of all them)
 
-        smach.State.__init__(self, outcomes=['success', 'failure', 'obstacle_detected','highway_free'],
+        smach.State.__init__(self, outcomes=['success', 'failure', 'obstacle_detected', 'highway_free'],
                              input_keys=['laser', 'frame', 'laser_available'])
 
     def execute(self, userdata):
@@ -107,10 +107,10 @@ class move_straight(smach.State):
         return ('obstacle_detected')
 
 
-class turn_around(smach.State):
+class TurnAround(smach.State):
 
     def __init__(self):
-        smach.State.__init__(self, outcomes=['success', 'failure', 'free_space_detected'],
+        smach.State.__init__(self, outcomes=['success', 'failure', 'free_space_detected','wall_detected'],
                              input_keys=['laser', 'laser_available'])
 
     def execute(self, userdata):
@@ -123,13 +123,22 @@ class turn_around(smach.State):
         rate = rospy.Rate(4)
 
         d = 0
-        while d < 0.35:  #This is the control cycle, it keeps turning the robot until there is not obstacle in front
+        while d < 0.5:  #This is the control cycle, it keeps turning the robot until there is not obstacle in front
 
             if (userdata.laser_available):
                 n = len(userdata.laser.ranges)
-                first_quarter = min(userdata.laser.ranges[:n // 4])
+                first_quarter = min(userdata.laser.ranges[:n // 4]) # eq to left distance?
                 fourth_quarter = min(userdata.laser.ranges[3 * n // 4:])
                 d = min(first_quarter, fourth_quarter)
+
+                left_avg = np.mean(first_quarter)
+                left_std = np.std(first_quarter)
+                right_avg = np.mean(fourth_quarter)
+                right_std = np.std(fourth_quarter)
+
+                # Wall detected on the left or right, proving is not a normal obstacle
+                if (0.5 < left_avg < 1.5 and left_std < 0.2) or (0.5 < right_avg < 1.5 and right_std < 0.2):
+                    return 'wall_detected'
 
             move.linear.x = 0.0
             move.angular.z = 0.35
@@ -142,6 +151,7 @@ class turn_around(smach.State):
 
         #it leaves the state with this outcome
         return ('free_space_detected')
+
 
 class SpeedUp(smach.State):
     def __init__(self):
@@ -168,7 +178,7 @@ class SpeedUp(smach.State):
                 d = min(first_quarter, fourth_quarter)
 
                 # Check if distance is below 0.80 meters to slow down
-                print('distance is:',d)
+                print('distance is:', d)
                 if d < 0.80:
                     rospy.loginfo("Obstacle detected at {:.2f}m. Slowing down...".format(d))
                     move.linear.x = 0.0
@@ -180,6 +190,60 @@ class SpeedUp(smach.State):
             move.angular.z = 0.0
             pub.publish(move)
             rate.sleep()
+
+class WallFollow(smach.State):
+    def __init__(self):
+        smach.State.__init__(
+            self,
+            outcomes=['success', 'failure'],
+            input_keys=['laser', 'laser_available']
+        )
+
+    def execute(self, userdata):
+        global pub
+        move = Twist()
+        rate = rospy.Rate(4)  # 4Hz control loop
+
+        start_time = rospy.Time.now()
+        max_follow_duration = rospy.Duration(10)  # Max duration for following the wall
+
+        while rospy.Time.now() - start_time < max_follow_duration:
+            if userdata.laser_available:
+                n = len(userdata.laser.ranges)
+
+                # Left and right distances (adjusting for the robot's width)
+                left_distances = userdata.laser.ranges[:n // 4]  # Left side
+                right_distances = userdata.laser.ranges[3 * n // 4:]  # Right side
+
+                # Calculate the minimum distances on the left and right
+                left_distance = min(left_distances)
+                right_distance = min(right_distances)
+
+                #rospy.loginfo(f"Left distance: {left_distance}, Right distance: {right_distance}")
+
+                # Wall-following logic: Adjust based on left and right wall detection
+                if left_distance < 0.5 and right_distance < 0.5:
+                    # If both sides are too close, turn slightly left to increase space
+                    move.angular.z = 0.2
+                elif left_distance < 0.5:
+                    # If too close to the left wall, turn right to maintain a safe distance
+                    move.angular.z = -0.2
+                elif right_distance < 0.5:
+                    # If too close to the right wall, turn left to maintain a safe distance
+                    move.angular.z = 0.2
+                else:
+                    # If both sides are sufficiently distant, go straight
+                    move.angular.z = 0.0
+
+                move.linear.x = 0.15  # Slow forward movement to follow the wall steadily
+                pub.publish(move)  # Publish the movement command
+                rate.sleep()
+
+        # Stop moving after max duration or condition met
+        move.linear.x = 0.0
+        move.angular.z = 0.0
+        pub.publish(move)
+        return 'success'  # Indicate that the wall-following was successful
 
 
 ## principal module
@@ -200,12 +264,13 @@ machine.userdata.laser_available = False
 img_sub = rospy.Subscriber('/camera/rgb/image_raw', Image, img_callback, callback_args=machine.userdata)
 
 #we create the states
-move_straight_state = move_straight()
-turn_around_state = turn_around()
+move_straight_state = MoveStraight()
+turn_around_state = TurnAround()
 speed_up_state = SpeedUp()
+wall_follow_state = WallFollow()
+
 #stop_and_wait_state = StopAndWait()
 #explore_randomly_state = ExploreRandomly()
-#wall_follow_state = WallFollow()
 
 with machine:
     #we add the states to the machine...
@@ -218,11 +283,17 @@ with machine:
     smach.StateMachine.add('TURN_AROUND', turn_around_state,
                            transitions={'success': 'success',
                                         'failure': 'failure',
-                                        'free_space_detected': 'MOVE_STRAIGHT'})
+                                        'free_space_detected': 'MOVE_STRAIGHT',
+                                        'wall_detected': 'WALL_FOLLOW'})
 
     smach.StateMachine.add('SPEED_UP', speed_up_state,
                            transitions={'slow_down': 'MOVE_STRAIGHT',
                                         'failure': 'failure'})
+
+    smach.StateMachine.add('WALL_FOLLOW', wall_follow_state,
+                           transitions={'success': 'MOVE_STRAIGHT',
+                                        'failure': 'TURN_AROUND'})
+
 
     #smach.StateMachine.add('STOP_AND_WAIT', stop_and_wait_state,
     #                       transitions={'continue': 'MOVE_STRAIGHT'})
@@ -230,10 +301,6 @@ with machine:
     #smach.StateMachine.add('EXPLORE_RANDOMLY', explore_randomly_state,
     #                       transitions={'success': 'MOVE_STRAIGHT',
     #                                    'failure': 'failure'})
-
-    #smach.StateMachine.add('WALL_FOLLOW', wall_follow_state,
-    #                       transitions={'success': 'MOVE_STRAIGHT',
-    #                                    'failure': 'TURN_AROUND'})
 
 #we run the machine
 machine.execute()
